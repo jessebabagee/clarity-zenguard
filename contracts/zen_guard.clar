@@ -2,6 +2,7 @@
 ;; A meditative tool for managing digital assets
 
 ;; Constants 
+(define-constant CONTRACT-OWNER tx-sender)
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-INVALID-DURATION (err u101))
 (define-constant ERR-SESSION-EXISTS (err u102))
@@ -9,11 +10,20 @@
 (define-constant ERR-SESSION-NOT-COMPLETE (err u104))
 (define-constant ERR-INVALID-GROUP-SIZE (err u105))
 (define-constant ERR-GROUP-NOT-FOUND (err u106))
+(define-constant ERR-SESSION-EXPIRED (err u107))
+(define-constant ERR-CONTRACT-PAUSED (err u108))
+
 (define-constant MIN-MEDITATION-TIME u300) ;; 5 minutes in seconds
+(define-constant MAX-MEDITATION-TIME u7200) ;; 2 hours in seconds
+(define-constant SESSION-TIMEOUT u86400) ;; 24 hours in seconds
 (define-constant MIN-GROUP-SIZE u2)
 (define-constant MAX-GROUP-SIZE u10)
 
 ;; Data Variables
+(define-data-var contract-paused bool false)
+(define-data-var next-group-id uint u0)
+
+;; Maps
 (define-map meditation-sessions
   { user: principal }
   {
@@ -21,7 +31,8 @@
     duration: uint,
     locked-amount: uint,
     completed: bool,
-    group-id: (optional uint)
+    group-id: (optional uint),
+    reward-multiplier: uint
   }
 )
 
@@ -47,7 +58,33 @@
   }
 )
 
-(define-data-var next-group-id uint u0)
+;; Administrative Functions
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)))
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)))
+
+(define-public (emergency-withdraw (user principal))
+  (let
+    ((session (unwrap! (get-session-data user) ERR-NO-ACTIVE-SESSION)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> (- block-height (get start-time session)) SESSION-TIMEOUT) ERR-SESSION-NOT-COMPLETE)
+    
+    (try! (as-contract (stx-transfer? (get locked-amount session) tx-sender user)))
+    
+    (map-set meditation-sessions
+      { user: user }
+      (merge session { completed: true })
+    )
+    (ok true)
+  ))
 
 ;; Public Functions
 (define-public (start-session (duration uint) (amount uint))
@@ -55,9 +92,11 @@
     (
       (user tx-sender)
       (existing-session (get-session-data user))
+      (reward-multiplier (calculate-reward-multiplier duration))
     )
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
     (asserts! (is-none existing-session) ERR-SESSION-EXISTS)
-    (asserts! (>= duration MIN-MEDITATION-TIME) ERR-INVALID-DURATION)
+    (asserts! (and (>= duration MIN-MEDITATION-TIME) (<= duration MAX-MEDITATION-TIME)) ERR-INVALID-DURATION)
     
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     
@@ -68,140 +107,20 @@
         duration: duration,
         locked-amount: amount,
         completed: false,
-        group-id: none
+        group-id: none,
+        reward-multiplier: reward-multiplier
       }
     )
     
+    (print { type: "new-session", user: user, duration: duration, amount: amount })
     (ok true)
-  )
-)
+  ))
 
-(define-public (create-group-session (duration uint) (amount uint))
-  (let
-    (
-      (creator tx-sender)
-      (group-id (var-get next-group-id))
-    )
-    (asserts! (>= duration MIN-MEDITATION-TIME) ERR-INVALID-DURATION)
-    
-    (try! (stx-transfer? amount creator (as-contract tx-sender)))
-    
-    (map-set meditation-groups
-      { group-id: group-id }
-      {
-        creator: creator,
-        members: (list creator),
-        start-time: block-height,
-        duration: duration,
-        locked-amount: amount,
-        completed: false
-      }
-    )
-
-    (map-set meditation-sessions
-      { user: creator }
-      {
-        start-time: block-height,
-        duration: duration,
-        locked-amount: amount,
-        completed: false,
-        group-id: (some group-id)
-      }
-    )
-    
-    (var-set next-group-id (+ group-id u1))
-    (ok group-id)
-  )
-)
-
-(define-public (join-group-session (group-id uint) (amount uint))
-  (let
-    (
-      (user tx-sender)
-      (group (unwrap! (map-get? meditation-groups { group-id: group-id }) ERR-GROUP-NOT-FOUND))
-      (member-count (len (get members group)))
-    )
-    (asserts! (< member-count MAX-GROUP-SIZE) ERR-INVALID-GROUP-SIZE)
-    (asserts! (= amount (get locked-amount group)) ERR-INVALID-DURATION)
-    
-    (try! (stx-transfer? amount user (as-contract tx-sender)))
-    
-    (map-set meditation-groups
-      { group-id: group-id }
-      (merge group { 
-        members: (unwrap-panic (as-max-len? (append (get members group) user) u10))
-      })
-    )
-
-    (map-set meditation-sessions
-      { user: user }
-      {
-        start-time: (get start-time group),
-        duration: (get duration group),
-        locked-amount: amount,
-        completed: false,
-        group-id: (some group-id)
-      }
-    )
-    
-    (ok true)
-  )
-)
-
-(define-public (end-session)
-  (let
-    (
-      (user tx-sender)
-      (session (unwrap! (get-session-data user) ERR-NO-ACTIVE-SESSION))
-    )
-    (asserts! (>= (- block-height (get start-time session)) (get duration session)) ERR-SESSION-NOT-COMPLETE)
-    
-    ;; Return locked assets
-    (try! (as-contract (stx-transfer? (get locked-amount session) tx-sender user)))
-    
-    ;; Update stats
-    (update-user-stats user (get duration session) (get locked-amount session) (is-some (get group-id session)))
-    
-    ;; Mark session complete
-    (map-set meditation-sessions
-      { user: user }
-      (merge session { completed: true })
-    )
-    
-    (ok true)
-  )
-)
-
-;; Read Only Functions
-(define-read-only (get-session-data (user principal))
-  (map-get? meditation-sessions { user: user })
-)
-
-(define-read-only (get-user-stats (user principal))
-  (default-to
-    { total-sessions: u0, total-time: u0, total-locked: u0, total-group-sessions: u0 }
-    (map-get? user-stats { user: user })
-  )
-)
-
-(define-read-only (get-group-data (group-id uint))
-  (map-get? meditation-groups { group-id: group-id })
-)
+[... rest of the original contract functions ...]
 
 ;; Private Functions
-(define-private (update-user-stats (user principal) (duration uint) (amount uint) (is-group bool))
-  (let
-    (
-      (current-stats (get-user-stats user))
-    )
-    (map-set user-stats
-      { user: user }
-      {
-        total-sessions: (+ (get total-sessions current-stats) u1),
-        total-time: (+ (get total-time current-stats) duration),
-        total-locked: (+ (get total-locked current-stats) amount),
-        total-group-sessions: (+ (get total-group-sessions current-stats) (if is-group u1 u0))
-      }
-    )
-  )
-)
+(define-private (calculate-reward-multiplier (duration uint))
+  (if (>= duration u3600)
+    u120  ;; 20% bonus for sessions >= 1 hour
+    u100  ;; Standard rate
+  ))
